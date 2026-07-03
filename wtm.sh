@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WARP & Tor Network Setup Script
 # This script installs and manages Cloudflare WARP and Tor connections
-# VERSION=1.4.1
+# VERSION=1.4.2
 
 # NB: this is an interactive, status-returning menu script. We deliberately do
 # NOT use `set -e` (errexit): many functions return non-zero as a normal status
@@ -9,7 +9,7 @@
 # break the menu loop. We keep `set -E` (errtrace) so the ERR trap below can
 # surface genuinely unexpected failures for diagnostics without exiting.
 set -E
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Error handler for debugging (diagnostic only — never exits)
@@ -70,10 +70,19 @@ fi
 WARP_CONFIG_FILE="/etc/wireguard/warp.conf"
 WARP_ACCOUNT_FILE="/etc/wireguard/wgcf-account.toml"
 WARP_XRAY_FILE="/etc/wireguard/warp-xray-outbound.json"
+WARP_SOCKOPT_FILE="/etc/wireguard/warp-sockopt-outbound.json"
 TOR_CONFIG_FILE="/etc/tor/torrc"
 WARP_SERVICE="wg-quick@warp"
 TOR_SERVICE="tor"
 LOG_FILE="/var/log/wtm.log"
+
+# Watchdog for the host wg-quick@warp interface (used by the freedom+sockopt
+# Xray variant and host tools): cron job that restarts the tunnel when the
+# handshake goes stale or traffic stops flowing.
+WARP_WATCHDOG_SCRIPT="/opt/wtm/warp-watchdog.sh"
+WARP_WATCHDOG_CRON="/etc/cron.d/wtm-warp-watchdog"
+WARP_WATCHDOG_LOG="/var/log/wtm-warp-watchdog.log"
+WARP_WATCHDOG_STAMP="/run/wtm-warp-watchdog.stamp"
 
 # Constant Cloudflare WARP WireGuard peer public key (same for every account).
 # Used when emitting a native Xray `wireguard` outbound. Source: official
@@ -269,6 +278,8 @@ Service Control:
     start-warp            Start WARP service
     stop-warp             Stop WARP service
     restart-warp          Restart WARP service
+    watchdog-on           Enable WARP interface watchdog (cron)
+    watchdog-off          Disable WARP interface watchdog
     start-tor             Start Tor service
     stop-tor              Stop Tor service
     restart-tor           Restart Tor service
@@ -665,6 +676,7 @@ install_warp() {
     # credentials BEFORE we strip/edit the profile for wg-quick.
     mkdir -p /etc/wireguard
     generate_warp_xray_outbound "$WGCF_PROFILE"
+    generate_warp_sockopt_outbound
     if [ -f "$WGCF_TEMP_DIR/wgcf-account.toml" ]; then
         cp "$WGCF_TEMP_DIR/wgcf-account.toml" "$WARP_ACCOUNT_FILE"
         chmod 600 "$WARP_ACCOUNT_FILE"
@@ -702,6 +714,10 @@ install_warp() {
         warn "WARP service failed to start — check: journalctl -u $WARP_SERVICE"
     fi
 
+    # Keep the host interface alive — the freedom+sockopt Xray variant and
+    # host tools depend on it staying up.
+    install_warp_watchdog
+
     restore_dns
 
     # Verify connection
@@ -713,8 +729,13 @@ install_warp() {
     fi
 
     echo
-    info "Native Xray WARP outbound written to: $WARP_XRAY_FILE"
-    echo -e "\033[38;5;244m   (paste it into your Xray config — see 'XRay Configuration' menu)\033[0m"
+    info "Xray outbound snippets written (paste one into your Xray config):"
+    echo -e "\033[38;5;244m   A) $WARP_XRAY_FILE\033[0m"
+    echo -e "\033[38;5;244m      native wireguard outbound — works anywhere, incl. Docker\033[0m"
+    echo -e "\033[38;5;244m   B) $WARP_SOCKOPT_FILE\033[0m"
+    echo -e "\033[38;5;244m      freedom + sockopt via host interface — fastest, Xray must\033[0m"
+    echo -e "\033[38;5;244m      run on the host (or network_mode: host)\033[0m"
+    echo -e "\033[38;5;244m   See 'XRay Configuration' menu for details.\033[0m"
 }
 
 # Build a native Xray `wireguard` outbound JSON from a wgcf profile.
@@ -770,6 +791,145 @@ EOF
     chmod 600 "$WARP_XRAY_FILE"
 }
 
+# Build the host-interface Xray outbound: freedom + sockopt bound to the
+# wg-quick@warp interface (SO_BINDTODEVICE). Fastest variant (kernel
+# WireGuard), but Xray must see the host's `warp` interface — bare-metal
+# Xray or a container with network_mode: host. Needs no keys: the tunnel
+# credentials live in the wg-quick config, not in Xray.
+generate_warp_sockopt_outbound() {
+    # Tag "warp" on purpose — same as the native variant, so every routing
+    # example (outboundTag: "warp") works with either variant unchanged.
+    # The two snippets are alternatives, never pasted together.
+    cat > "$WARP_SOCKOPT_FILE" <<'EOF'
+{
+  "tag": "warp",
+  "protocol": "freedom",
+  "settings": {
+    "domainStrategy": "UseIP"
+  },
+  "streamSettings": {
+    "sockopt": {
+      "interface": "warp",
+      "tcpFastOpen": true
+    }
+  }
+}
+EOF
+    chmod 644 "$WARP_SOCKOPT_FILE"
+}
+
+# Cron-driven watchdog for wg-quick@warp: the host-interface variant is only
+# as stable as the interface itself, so keep it alive automatically. Restarts
+# the unit when it is inactive, the WireGuard handshake is missing/stale, or
+# ICMP through the tunnel stops working — with a cooldown so a flapping
+# Cloudflare endpoint cannot cause a restart storm.
+install_warp_watchdog() {
+    mkdir -p "$(dirname "$WARP_WATCHDOG_SCRIPT")"
+    # Header is an UNQUOTED heredoc: paths/unit name interpolate from the
+    # wtm.sh constants above, so there is one source of truth. The body below
+    # is a quoted heredoc — its $vars must stay literal.
+    cat > "$WARP_WATCHDOG_SCRIPT" <<EOF
+#!/usr/bin/env bash
+# wtm WARP watchdog — restarts $WARP_SERVICE when the tunnel goes stale.
+IFACE="warp"
+SERVICE="$WARP_SERVICE"
+HANDSHAKE_THRESHOLD=180   # seconds since last handshake => stale
+RESTART_COOLDOWN=120      # min seconds between restarts
+STAMP="$WARP_WATCHDOG_STAMP"
+LOG="$WARP_WATCHDOG_LOG"
+MAX_LOG_LINES=1000
+EOF
+    cat >> "$WARP_WATCHDOG_SCRIPT" <<'EOF'
+
+# Trim the log once per run (not on every append)
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt "$MAX_LOG_LINES" ]; then
+    tail -n "$MAX_LOG_LINES" "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$LOG"
+}
+
+now=$(date +%s)
+reason=""
+if ! systemctl is-active --quiet "$SERVICE"; then
+    reason="service inactive"
+else
+    hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    case "$hs" in
+        ''|*[!0-9]*|0) reason="no handshake" ;;
+        *)
+            if [ $((now - hs)) -gt "$HANDSHAKE_THRESHOLD" ]; then
+                reason="handshake stale ($((now - hs))s)"
+            # Same HTTPS probe the rest of wtm uses; curl is a hard wtm
+            # dependency, while ping may be absent and ICMP filtered
+            elif ! curl -s --max-time 8 --interface "$IFACE" \
+                    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+                    | grep -qE 'warp=(on|plus)'; then
+                reason="connectivity check via $IFACE failed"
+            fi
+            ;;
+    esac
+fi
+
+[ -z "$reason" ] && exit 0
+
+last=$(cat "$STAMP" 2>/dev/null)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+if [ $((now - last)) -lt "$RESTART_COOLDOWN" ]; then
+    log "SKIP ($reason) — cooldown"
+    exit 0
+fi
+
+echo "$now" > "$STAMP"
+if systemctl restart "$SERVICE" >/dev/null 2>&1; then
+    log "RESTART ($reason) — ok"
+else
+    log "RESTART ($reason) — FAILED, check: journalctl -u $SERVICE"
+fi
+EOF
+    chmod 755 "$WARP_WATCHDOG_SCRIPT"
+
+    cat > "$WARP_WATCHDOG_CRON" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root $WARP_WATCHDOG_SCRIPT
+EOF
+    chmod 644 "$WARP_WATCHDOG_CRON"
+
+    # /etc/cron.d entries only run if a cron daemon is active (cron on
+    # Debian/Ubuntu, crond on RHEL-family)
+    if ! systemctl is-active --quiet cron 2>/dev/null && \
+       ! systemctl is-active --quiet crond 2>/dev/null; then
+        warn "No active cron daemon detected — watchdog will not run until cron/crond is started"
+    fi
+    ok "WARP watchdog enabled (cron: every 5 min, log: $WARP_WATCHDOG_LOG)"
+}
+
+remove_warp_watchdog() {
+    local was_enabled=false
+    warp_watchdog_enabled && was_enabled=true
+
+    # Kill an in-flight run so it cannot restart the unit after removal
+    pkill -f "$WARP_WATCHDOG_SCRIPT" 2>/dev/null || true
+
+    # Keep $WARP_WATCHDOG_LOG — the restart history is diagnostic data;
+    # uninstall_warp removes it explicitly.
+    rm -f "$WARP_WATCHDOG_CRON" "$WARP_WATCHDOG_SCRIPT" "$WARP_WATCHDOG_STAMP"
+    # The watchdog dir may hold nothing else — remove it only if empty
+    rmdir "$(dirname "$WARP_WATCHDOG_SCRIPT")" 2>/dev/null || true
+
+    if [ "$was_enabled" = true ]; then
+        ok "WARP watchdog disabled"
+    else
+        info "WARP watchdog was not enabled — nothing to remove"
+    fi
+}
+
+warp_watchdog_enabled() {
+    [ -f "$WARP_WATCHDOG_CRON" ]
+}
+
 check_ipv6_support() {
     sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -q ' = 0' && \
     sysctl net.ipv6.conf.default.disable_ipv6 2>/dev/null | grep -q ' = 0' && \
@@ -782,7 +942,10 @@ verify_warp_connection() {
 
 uninstall_warp() {
     step "Uninstalling WARP..."
-    
+
+    # Remove watchdog first so cron cannot restart the unit mid-uninstall
+    remove_warp_watchdog
+
     # Stop and disable service
     if systemctl is-active --quiet "$WARP_SERVICE" 2>/dev/null; then
         systemctl stop "$WARP_SERVICE" >/dev/null 2>&1
@@ -790,9 +953,11 @@ uninstall_warp() {
     if systemctl is-enabled --quiet "$WARP_SERVICE" 2>/dev/null; then
         systemctl disable "$WARP_SERVICE" >/dev/null 2>&1
     fi
-    
-    # Remove configuration, saved credentials and generated Xray snippet
-    rm -f "$WARP_CONFIG_FILE" "$WARP_ACCOUNT_FILE" "$WARP_XRAY_FILE"
+
+    # Remove configuration, saved credentials, generated Xray snippets and
+    # the watchdog restart history (kept by plain watchdog-off)
+    rm -f "$WARP_CONFIG_FILE" "$WARP_ACCOUNT_FILE" "$WARP_XRAY_FILE" \
+          "$WARP_SOCKOPT_FILE" "$WARP_WATCHDOG_LOG"
 
     # Remove wgcf binary
     if [ -f /usr/local/bin/wgcf ]; then
@@ -1194,6 +1359,12 @@ control_service() {
     # printing a green checkmark regardless of exit status.
     if systemctl "$action" "$service_name" >/dev/null 2>&1; then
         ok "$service_type service $past"
+        # A deliberate stop would otherwise be silently undone by the
+        # watchdog's next cron tick — tell the user how to keep it down.
+        if [ "$action" = "stop" ] && [ "$service_type" = "warp" ] && warp_watchdog_enabled; then
+            warn "WARP watchdog is enabled — it will restart the service within 5 minutes"
+            echo -e "\033[38;5;244m   To keep WARP stopped: wtm watchdog-off\033[0m"
+        fi
     else
         error "Failed to $action $service_type service ($service_name)"
         echo -e "\033[38;5;244m   Check logs: journalctl -u $service_name -n 20 --no-pager\033[0m"
@@ -1403,9 +1574,20 @@ render_warp_status_block() {
             else
                 printf "   \033[38;5;15m%-12s\033[0m \033[1;31m❌ Not found\033[0m\n" "Interface:"
             fi
+            if warp_watchdog_enabled; then
+                printf "   \033[38;5;15m%-12s\033[0m \033[1;32m✅ Enabled\033[0m \033[38;5;250m(cron */5)\033[0m\n" "Watchdog:"
+            else
+                printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m⚪ Disabled (wtm watchdog-on)\033[0m\n" "Watchdog:"
+            fi
             ;;
         installed)
             echo -e "${color}⚠️  INSTALLED BUT STOPPED\033[0m"
+            # In the stopped state the watchdog matters most: it is about to
+            # bring the service back up on its own.
+            if warp_watchdog_enabled; then
+                echo -e "\033[1;33m   Watchdog is enabled — will auto-restart within 5 min\033[0m"
+                echo -e "\033[38;5;244m   (wtm watchdog-off to keep WARP stopped)\033[0m"
+            fi
             echo -e "\033[38;5;244m   Use WARP menu to start service\033[0m"
             ;;
         not_installed)
@@ -1733,9 +1915,9 @@ show_xray_config_page() {
     printf "${BOLD}                     XRAY CONFIGURATION                      ${NC}\n"
     printf "${BLUE}═══════════════════════════════════════════════════════════════${NC}\n\n"
 
-    printf "${BOLD}${CYAN}WARP via native Xray WireGuard outbound (recommended)${NC}\n"
+    printf "${BOLD}${CYAN}Variant A — native Xray WireGuard outbound${NC}\n"
     printf "${DIM}Xray-core (>=1.6.5, current v26.x) dials WARP directly — no host${NC}\n"
-    printf "${DIM}wg-quick interface, /etc/wireguard/warp.conf or kernel module needed.${NC}\n\n"
+    printf "${DIM}wg-quick interface needed. Works anywhere, incl. Docker (remnanode).${NC}\n\n"
 
     if [ -f "$WARP_XRAY_FILE" ]; then
         printf "${YELLOW}A ready-to-use outbound with YOUR WARP keys was generated at:${NC}\n"
@@ -1852,11 +2034,32 @@ EOF
     printf "${YELLOW}• A wireguard outbound can NOT carry streamSettings/sockopt;${NC}\n"
     printf "${YELLOW}  to chain it behind another proxy use dialerProxy on that proxy.${NC}\n\n"
 
-    printf "${BOLD}${CYAN}Legacy host-interface variant (non-Xray host apps):${NC}\n"
-    printf "${DIM}This script also installs a wg-quick@warp kernel interface. It is${NC}\n"
-    printf "${DIM}fine for host tools (curl --interface warp), but for Xray prefer the${NC}\n"
-    printf "${DIM}native outbound above — the old freedom + sockopt.interface:\"warp\"${NC}\n"
-    printf "${DIM}config depends on that kernel interface and fails in many containers.${NC}\n\n"
+    printf "${BOLD}${CYAN}Variant B — host interface (freedom + sockopt)${NC}\n"
+    printf "${DIM}Binds Xray sockets to the wg-quick@warp kernel interface this script${NC}\n"
+    printf "${DIM}installs. Fastest (kernel WireGuard), no keys inside the Xray config.${NC}\n\n"
+
+    # The snippet is fully static (no per-account keys) — (re)generate on
+    # demand instead of keeping a duplicate copy of the JSON here.
+    if [ ! -f "$WARP_SOCKOPT_FILE" ]; then
+        mkdir -p /etc/wireguard
+        generate_warp_sockopt_outbound
+    fi
+    printf "${YELLOW}Ready-to-use outbound at:${NC} ${GREEN}$WARP_SOCKOPT_FILE${NC}\n\n"
+    printf "${GREEN}"
+    cat "$WARP_SOCKOPT_FILE"
+    printf "${NC}\n\n"
+
+    printf "${YELLOW}• Requires Xray to SEE the host 'warp' interface: bare-metal Xray${NC}\n"
+    printf "${YELLOW}  or a container with network_mode: host. In a bridge-network${NC}\n"
+    printf "${YELLOW}  container (default remnanode) it will NOT work — use Variant A.${NC}\n"
+    printf "${YELLOW}• Same tag \"warp\" as Variant A, so the routing examples above work${NC}\n"
+    printf "${YELLOW}  unchanged. Paste only ONE variant into a config, never both.${NC}\n"
+    printf "${YELLOW}• Depends on wg-quick@warp staying up — the watchdog installed by${NC}\n"
+    printf "${YELLOW}  this script auto-restarts it (toggle: wtm watchdog-on/off).${NC}\n\n"
+
+    printf "${BOLD}${CYAN}Which one to pick:${NC}\n"
+    printf "${YELLOW}• Xray in Docker/container  → Variant A (native wireguard)${NC}\n"
+    printf "${YELLOW}• Xray on the bare host     → Variant B (faster, kernel WireGuard)${NC}\n\n"
 
     printf "${DIM}Press Enter to continue...${NC}"
     read -r
@@ -2256,6 +2459,16 @@ main() {
                 ;;
             restart-warp)
                 control_service restart warp
+                ;;
+            watchdog-on)
+                if [ ! -f "$WARP_CONFIG_FILE" ]; then
+                    error "WARP is not installed — run: $(basename "$0") install-warp"
+                    exit 1
+                fi
+                install_warp_watchdog
+                ;;
+            watchdog-off)
+                remove_warp_watchdog
                 ;;
             start-tor)
                 control_service start tor

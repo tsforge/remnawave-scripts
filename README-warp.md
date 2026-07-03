@@ -1,8 +1,10 @@
-# 🌐 WTM - WARP & Tor Manager v1.4.1 - Профессиональное управление анонимными сетями
+# 🌐 WTM - WARP & Tor Manager v1.4.2 - Профессиональное управление анонимными сетями
 
 **WTM** - это комплексный bash-скрипт для автоматизации установки и управления **Cloudflare WARP** и **Tor** на Linux серверах.
 
-🆕 **Версия v1.4.1** — безопасный дефолт `"noKernelTun": true` в генерируемом Xray-outbound: конфиг работает «из коробки» в Docker и других контейнерах.
+🆕 **Версия v1.4.2** — host-вариант подключения Xray (`freedom` + `sockopt.interface`) стал полноценным: готовый сниппет + cron-watchdog, который сам перезапускает интерфейс `warp` при потере handshake.
+
+**v1.4.1** — безопасный дефолт `"noKernelTun": true` в генерируемом Xray-outbound: конфиг работает «из коробки» в Docker и других контейнерах.
 
 **v1.4.0** — современная интеграция WARP в ядро **Xray** через нативный `wireguard` outbound, безопасное самообновление, исправление опасного апгрейда ОС и крупный рефакторинг.
 
@@ -26,6 +28,12 @@
 - **Глобальная установка** в `/usr/local/bin/wtm` для системного доступа
 - **Логирование действий** в `/var/log/wtm.log`
 - **Полноценная CLI справка** `wtm --help`
+
+## 💾 Изменения в v1.4.2
+
+- **Host-вариант для Xray — полноценный, а не «legacy»**: при установке WARP генерируется второй готовый сниппет `/etc/wireguard/warp-sockopt-outbound.json` (`freedom` + `sockopt.interface: "warp"` + `tcpFastOpen`). Он быстрее нативного (kernel WireGuard вместо userspace-стека) и не держит ключи в конфиге Xray, но требует, чтобы Xray видел хостовый интерфейс `warp`: Xray на голом хосте или контейнер с `network_mode: host`. В bridge-контейнере (дефолтный remnanode) — только нативный вариант.
+- **Watchdog интерфейса `warp`** (ставится автоматически при `install-warp`): cron-задание раз в 5 минут проверяет юнит `wg-quick@warp`, возраст handshake (>180 с = протух) и связность через туннель (HTTPS-запрос `cdn-cgi/trace`, как в остальных проверках скрипта); при сбое перезапускает интерфейс с cooldown 120 с. Управление: `wtm watchdog-on` / `wtm watchdog-off`; лог: `/var/log/wtm-warp-watchdog.log` (сохраняется при `watchdog-off` для диагностики). Статус watchdog виден в меню; `wtm stop-warp` предупреждает, что watchdog поднимет сервис обратно.
+- Меню «XRay Configuration» показывает **оба** варианта (A — нативный, B — host) с критерием выбора; при удалении WARP watchdog и оба сниппета вычищаются.
 
 ## 💾 Изменения в v1.4.1
 
@@ -98,6 +106,8 @@ sudo wtm update                      # Альтернативная команд
 
 ### 🔧 Конфигурация
 - Готовый нативный `wireguard` outbound для Xray (`/etc/wireguard/warp-xray-outbound.json`)
+- Готовый host-outbound `freedom` + `sockopt` (`/etc/wireguard/warp-sockopt-outbound.json`, 🆕 v1.4.2)
+- Watchdog интерфейса `warp` с автоперезапуском по handshake/ping (🆕 v1.4.2)
 - Примеры роутинга .onion через Tor и стриминга/рекламы через WARP
 - Примеры использования curl, ssh, git с прокси
 
@@ -207,6 +217,10 @@ sudo wtm start-warp
 sudo wtm stop-warp
 sudo wtm restart-warp
 
+# Watchdog интерфейса warp (🆕 v1.4.2)
+sudo wtm watchdog-on
+sudo wtm watchdog-off
+
 # Запустить/остановить Tor
 sudo wtm start-tor
 sudo wtm stop-tor  
@@ -250,7 +264,7 @@ sudo wtm self-update
 ### 🖥️ Главное меню
 
 ```
-🌐 WARP & Tor Manager v1.4.1
+🌐 WARP & Tor Manager v1.4.2
 ──────────────────────────────────────────────────
 
 🛠️  Service Management:
@@ -305,7 +319,9 @@ sudo wtm self-update
 - **Сервис**: `wg-quick@warp`
 - **Конфиг wg-quick**: `/etc/wireguard/warp.conf`
 - **Учётные данные wgcf**: `/etc/wireguard/wgcf-account.toml` (права 600)
-- **Готовый Xray outbound**: `/etc/wireguard/warp-xray-outbound.json` (🆕 v1.4.0)
+- **Готовый Xray outbound (вариант A, нативный)**: `/etc/wireguard/warp-xray-outbound.json` (🆕 v1.4.0)
+- **Готовый Xray outbound (вариант B, host)**: `/etc/wireguard/warp-sockopt-outbound.json` (🆕 v1.4.2)
+- **Watchdog**: `/opt/wtm/warp-watchdog.sh`, cron `/etc/cron.d/wtm-warp-watchdog`, лог `/var/log/wtm-warp-watchdog.log` (🆕 v1.4.2)
 - **Endpoint**: `engage.cloudflareclient.com:2408`
 
 ### Tor:
@@ -338,13 +354,15 @@ socks5 127.0.0.1 9050
 
 ## 🎯 Интеграция с XRay
 
-> 🆕 **v1.4.0:** рекомендуемый способ — **нативный `wireguard` outbound**. Xray подключается к WARP напрямую, без host-интерфейса `wg-quick@warp`. Это надёжнее в контейнерах и не требует прав на изменение `rp_filter`.
+> Скрипт готовит **оба** варианта подключения Xray к WARP — выбирайте по тому, где живёт Xray:
+> **A. Нативный `wireguard` outbound** — Xray подключается к WARP напрямую, без host-интерфейса. Работает везде, включая Docker/remnanode.
+> **B. Host-интерфейс (`freedom` + `sockopt`)** — быстрее (kernel WireGuard), но Xray должен видеть интерфейс `warp`: голый хост или `network_mode: host`.
 
 После `sudo wtm install-warp` готовый outbound с **вашими** ключами лежит в
 `/etc/wireguard/warp-xray-outbound.json`. Команда `sudo wtm xray-examples`
 покажет его содержимое.
 
-### Нативный WARP outbound (рекомендуется)
+### Вариант A: нативный WARP outbound (Docker/контейнеры)
 
 ```json
 {
@@ -438,12 +456,30 @@ socks5 127.0.0.1 9050
 
 > **Примечание:** `"type": "field"` в правилах роутинга в актуальном Xray больше **не нужен** (удалён/игнорируется). Теги `geosite:`/`geoip:` требуют наличия `geosite.dat`/`geoip.dat` в `/usr/local/share/xray/` (или задайте `XRAY_LOCATION_ASSET`).
 
-### 🧩 Legacy: host-интерфейсный вариант
+### 🧩 Вариант B: host-интерфейс (`freedom` + `sockopt`) — 🆕 v1.4.2
 
-Скрипт по-прежнему поднимает kernel-интерфейс `wg-quick@warp` — он удобен для
-хостовых утилит (`curl --interface warp`). Для **Xray** же предпочтительнее
-нативный outbound выше: старый вариант `freedom` + `sockopt.interface:"warp"`
-зависит от этого kernel-интерфейса и часто не работает в контейнерах.
+Готовый сниппет лежит в `/etc/wireguard/warp-sockopt-outbound.json`:
+
+```json
+{
+  "tag": "warp",
+  "protocol": "freedom",
+  "settings": { "domainStrategy": "UseIP" },
+  "streamSettings": {
+    "sockopt": { "interface": "warp", "tcpFastOpen": true }
+  }
+}
+```
+
+> Тег `"warp"` совпадает с вариантом A — все примеры роутинга выше работают без изменений. В один конфиг вставляйте только **один** из вариантов.
+
+Xray привязывает исходящие сокеты к kernel-интерфейсу `wg-quick@warp` (его поднимает скрипт). Это **самый быстрый** вариант — kernel WireGuard вместо userspace-стека — и ключи WARP не попадают в конфиг Xray.
+
+**Требование:** Xray должен видеть хостовый интерфейс `warp` — Xray на голом хосте или контейнер с `network_mode: host`. В bridge-контейнере (дефолтный remnanode) интерфейс не виден — используйте вариант A (нативный).
+
+**Стабильность:** за интерфейсом следит watchdog (ставится автоматически): cron раз в 5 минут проверяет юнит, возраст handshake и связность через туннель (HTTPS `cdn-cgi/trace`), при сбое перезапускает `wg-quick@warp` (cooldown 120 с). Управление: `wtm watchdog-on` / `wtm watchdog-off`, лог: `/var/log/wtm-warp-watchdog.log`.
+
+**Как выбрать:** Xray в Docker → вариант A; Xray на хосте → вариант B.
 
 ## 🛠️ Устранение неполадок
 
@@ -537,7 +573,7 @@ sudo wtm system-info
 
 ---
 
-**Версия**: v1.4.1  
+**Версия**: v1.4.2  
 **Последнее обновление**: 4 июля 2026  
 **Автор**: DigneZzZ  
 **Проект**: [https://gig.ovh](https://gig.ovh)
