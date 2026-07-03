@@ -34,6 +34,7 @@
 - **Host-вариант для Xray — полноценный, а не «legacy»**: при установке WARP генерируется второй готовый сниппет `/etc/wireguard/warp-sockopt-outbound.json` (`freedom` + `sockopt.interface: "warp"` + `tcpFastOpen`). Он быстрее нативного (kernel WireGuard вместо userspace-стека) и не держит ключи в конфиге Xray, но требует, чтобы Xray видел хостовый интерфейс `warp`: Xray на голом хосте или контейнер с `network_mode: host`. В bridge-контейнере (дефолтный remnanode) — только нативный вариант.
 - **Watchdog интерфейса `warp`** (ставится автоматически при `install-warp`): cron-задание раз в 5 минут проверяет юнит `wg-quick@warp`, возраст handshake (>180 с = протух) и связность через туннель (HTTPS-запрос `cdn-cgi/trace`, как в остальных проверках скрипта); при сбое перезапускает интерфейс с cooldown 120 с. Управление: `wtm watchdog-on` / `wtm watchdog-off`; лог: `/var/log/wtm-warp-watchdog.log` (сохраняется при `watchdog-off` для диагностики). Статус watchdog виден в меню; `wtm stop-warp` предупреждает, что watchdog поднимет сервис обратно.
 - Меню «XRay Configuration» показывает **оба** варианта (A — нативный, B — host) с критерием выбора; при удалении WARP watchdog и оба сниппета вычищаются.
+- **Автовычисление `reserved`** (PR #34): нативный outbound генерируется с account-specific значением из client_id вашей регистрации (некоторые PoP Cloudflare молча дропают handshake на общем `[0, 0, 0]`); при недоступном API — fallback на `[0, 0, 0]`. Команда `wtm regen-warp-xray` пересчитывает значение на существующей установке без переустановки.
 
 ## 💾 Изменения в v1.4.1
 
@@ -386,7 +387,7 @@ socks5 127.0.0.1 9050
 ```
 
 - `"noKernelTun": true` (генерируется по умолчанию, 🆕 v1.4.1) — userspace-стек, работает в Docker/LXC и на read-only `/proc/sys`. На голом хосте с `CAP_NET_ADMIN` можно поставить `false` — kernel-TUN быстрее.
-- Для отдельных PoP Cloudflare нужен реальный `reserved` (из `wgcf-cli generate --xray` или `warp-reg`).
+- `reserved` вычисляется автоматически из вашей WARP-регистрации (client_id через API Cloudflare). Если в файле осталось `[0, 0, 0]` (API был недоступен) — обновите командой `sudo wtm regen-warp-xray`.
 - На `wireguard` outbound **нельзя** вешать `streamSettings`/`sockopt`; для цепочки используйте `dialerProxy` на другом outbound.
 
 ### Полный пример: WARP + Tor + роутинг
