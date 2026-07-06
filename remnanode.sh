@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Version: 4.3.3
+# Version: 4.3.7
 set -e
-SCRIPT_VERSION="4.3.6"
+SCRIPT_VERSION="4.3.7"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -516,10 +516,23 @@ install_latest_xray_core() {
     mkdir -p "$DATA_DIR"
     cd "$DATA_DIR"
     
-    latest_release=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | grep -oP '"tag_name": "\K(.*?)(?=")')
+    # Fetch the newest release INCLUDING pre-releases.
+    # GitHub's /releases/latest endpoint returns only the newest *stable* release, but
+    # the current node build requires the pre-release Xray-core. The /releases list is
+    # ordered newest-first and includes pre-releases, so we take its first entry.
+    local release_json
+    release_json=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1") || true
+    latest_release=$(echo "$release_json" | grep -oP '"tag_name":\s*"\K(.*?)(?=")' | head -n1) || true
+    local is_prerelease
+    is_prerelease=$(echo "$release_json" | grep -oP '"prerelease":\s*\K(true|false)' | head -n1) || true
+
     if [ -z "$latest_release" ]; then
         colorized_echo red "Failed to fetch latest Xray-core version."
         exit 1
+    fi
+
+    if [ "$is_prerelease" = "true" ]; then
+        colorized_echo yellow "⚠️  Newest Xray-core is a pre-release: ${latest_release}"
     fi
     
     if ! dpkg -s unzip >/dev/null 2>&1; then
@@ -560,7 +573,7 @@ install_latest_xray_core() {
         colorized_echo green "  ✅ geosite.dat"
     fi
     
-    colorized_echo green "Latest Xray-core (${latest_release}) installed at $XRAY_FILE"
+    colorized_echo green "Xray-core (${latest_release}) installed at $XRAY_FILE"
 }
 
 setup_log_rotation() {
