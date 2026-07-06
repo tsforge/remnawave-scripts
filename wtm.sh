@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WARP & Tor Network Setup Script
 # This script installs and manages Cloudflare WARP and Tor connections
-# VERSION=1.4.2
+# VERSION=1.5.0
 
 # NB: this is an interactive, status-returning menu script. We deliberately do
 # NOT use `set -e` (errexit): many functions return non-zero as a normal status
@@ -9,7 +9,7 @@
 # break the menu loop. We keep `set -E` (errtrace) so the ERR trap below can
 # surface genuinely unexpected failures for diagnostics without exiting.
 set -E
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.5.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Error handler for debugging (diagnostic only — never exits)
@@ -46,10 +46,22 @@ FORCE_MODE=false
 while [[ $# -gt 0 ]]; do  
     key="$1"  
     case $key in  
-        --force|-f)  
+        --force|-f)
             FORCE_MODE=true
             shift
-        ;;  
+        ;;
+        --license|--license-key)
+            # WARP+ license key for install-warp. `shift`-then-read avoids the
+            # `shift 2` trap when the flag is the last arg (would re-loop forever);
+            # the guarded second shift avoids a stderr warning when no value follows.
+            shift
+            WARP_LICENSE_KEY="$1"
+            [ $# -gt 0 ] && shift
+        ;;
+        --license=*|--license-key=*)
+            WARP_LICENSE_KEY="${key#*=}"
+            shift
+        ;;
         -h|--help)
             COMMAND="help"
             shift
@@ -268,6 +280,7 @@ Usage: $(basename "$0") [@] <command> [options]
 
 Installation:
     install-warp          Install Cloudflare WARP
+    install-warp --license <KEY>   Install WARP and upgrade to WARP+
     install-tor           Install Tor anonymity network
     install-all           Install both WARP and Tor
     install-warp-force    Force reinstall WARP
@@ -291,6 +304,9 @@ Monitoring:
     warp-memory           WARP memory diagnostic
     system-info           Show system information
 
+WARP+:
+    warp-plus <KEY>       Upgrade an installed WARP to WARP+ (license key)
+
 Xray:
     regen-warp-xray       Rebuild Xray outbound + recompute reserved
     xray-examples         Show Xray config examples
@@ -308,12 +324,15 @@ Script Management:
 
 Options:
     --force, -f           Force operation
+    --license <KEY>       WARP+ license key (with install-warp)
     --help, -h            Show this help
     --version, -v         Show version
 
 Examples:
     $(basename "$0") install-all
     $(basename "$0") @ install-warp --force
+    $(basename "$0") install-warp --license 1a2b3c4d-5e6f7g8h-9i0j1k2l
+    $(basename "$0") warp-plus 1a2b3c4d-5e6f7g8h-9i0j1k2l
     $(basename "$0") status
     $(basename "$0") test
 
@@ -661,6 +680,21 @@ install_warp() {
         error_exit "WARP registration failed (Cloudflare API may be temporarily unavailable)"
     fi
 
+    # Optional WARP+ upgrade: if a license key was supplied (--license / env
+    # WARP_LICENSE_KEY), apply it to the freshly-registered device BEFORE we
+    # generate the profile, so the generated config already belongs to the
+    # upgraded (WARP+) device.
+    if [ -n "${WARP_LICENSE_KEY:-}" ]; then
+        info "Applying WARP+ license..."
+        warp_validate_license "$WARP_LICENSE_KEY" || warn "License key has an unusual format — trying anyway"
+        warp_set_license "$WGCF_TEMP_DIR/wgcf-account.toml" "$WARP_LICENSE_KEY"
+        if warp_wgcf_update "$WGCF_TEMP_DIR/wgcf-account.toml"; then
+            ok "WARP+ license applied"
+        else
+            warn "WARP+ upgrade failed — continuing with the free account"
+        fi
+    fi
+
     if ! ( cd "$WGCF_TEMP_DIR" && wgcf generate ) >/dev/null 2>&1; then
         restore_dns
         rm -rf "$WGCF_TEMP_DIR"
@@ -733,6 +767,10 @@ install_warp() {
         ok "WARP installation completed successfully"
     else
         warn "WARP installed but connection verification failed"
+    fi
+
+    if [ -n "${WARP_LICENSE_KEY:-}" ]; then
+        info "Account type reported by Cloudflare: $(warp_account_status)"
     fi
 
     echo
@@ -1001,6 +1039,128 @@ regen_warp_xray_outbound() {
         warn "Generic endpoint still works; re-run later or reinstall to fetch the real value."
     else
         info "Computed account-specific ${reserved}"
+    fi
+}
+
+# ── WARP+ (paid license) ──────────────────────────────────────────────────
+# Cloudflare applies WARP+ to the REGISTERED DEVICE server-side: the local
+# WireGuard config (keys, endpoint, reserved, addresses) does not change — only
+# the speed cap on this device_id is lifted. So upgrading needs NO profile or
+# Xray-outbound regeneration, and re-registration is NOT required (that would
+# just burn another device slot of the key). We write license_key into the
+# account record and run `wgcf update`, which pushes it to the existing device.
+
+# Sanity-check a WARP+ license key. Canonical form is three 8-char groups
+# separated by dashes. Only WARN on mismatch (never hard-reject a non-empty
+# key) so a future Cloudflare format change cannot lock users out.
+# Returns 0 = looks canonical, 1 = unusual shape, 2 = empty.
+warp_validate_license() {
+    local key="$1"
+    [ -n "$key" ] || return 2
+    printf '%s' "$key" | grep -qE '^[A-Za-z0-9]{8}-[A-Za-z0-9]{8}-[A-Za-z0-9]{8}$' || return 1
+    return 0
+}
+
+# Set (or replace) license_key in a wgcf account.toml.
+warp_set_license() {
+    local account="$1" key="$2"
+    [ -f "$account" ] || return 1
+    if grep -qE '^[[:space:]]*license_key' "$account"; then
+        sed -i -E "s|^[[:space:]]*license_key[[:space:]]*=.*|license_key = '${key}'|" "$account"
+    else
+        printf "license_key = '%s'\n" "$key" >> "$account"
+    fi
+}
+
+# Push the account (incl. a changed license_key) to Cloudflare. Same transient
+# 5xx retry policy as registration.
+warp_wgcf_update() {
+    local account="$1" attempt
+    command -v wgcf >/dev/null 2>&1 || return 127
+    for attempt in 1 2 3; do
+        if WGCF_ACCOUNT="$account" timeout 30 wgcf update >/dev/null 2>&1; then
+            return 0
+        fi
+        warn "WARP+ update attempt $attempt failed, retrying in 3s..."
+        sleep 3
+    done
+    return 1
+}
+
+# Best-effort account type: prints "WARP+", "Free" or "unknown". Time-boxed —
+# `wgcf status` hits the Cloudflare API, so never let it hang the caller.
+warp_account_status() {
+    local account="${1:-$WARP_ACCOUNT_FILE}"
+    [ -f "$account" ] || { echo "unknown"; return; }
+    command -v wgcf >/dev/null 2>&1 || { echo "unknown"; return; }
+    local out
+    out=$(WGCF_ACCOUNT="$account" timeout 8 wgcf status 2>/dev/null) || { echo "unknown"; return; }
+    [ -n "$out" ] || { echo "unknown"; return; }
+    if printf '%s' "$out" | grep -qiE 'unlimited|warp\+'; then
+        echo "WARP+"
+    elif printf '%s' "$out" | grep -qiE 'limited|free'; then
+        echo "Free"
+    else
+        echo "unknown"
+    fi
+}
+
+# `wtm warp-plus <KEY>` — upgrade an already-installed WARP to WARP+ in place.
+# Reads the key from $1 or $WARP_LICENSE_KEY. No profile/outbound regeneration
+# (see note above); just update the device and bounce the tunnel.
+apply_warp_plus() {
+    local key="${1:-${WARP_LICENSE_KEY:-}}"
+
+    if [ -z "$key" ]; then
+        error "No WARP+ license key provided"
+        echo "Usage: $(basename "$0") warp-plus <LICENSE-KEY>"
+        return 1
+    fi
+    if ! command -v wgcf >/dev/null 2>&1; then
+        error "wgcf not found — install WARP first: $(basename "$0") install-warp"
+        return 1
+    fi
+    if [ ! -f "$WARP_ACCOUNT_FILE" ]; then
+        error "WARP account record not found ($WARP_ACCOUNT_FILE)"
+        echo "Reinstall with the license instead: $(basename "$0") install-warp-force --license $key"
+        return 1
+    fi
+
+    warp_validate_license "$key" || warn "License key has an unusual format — trying anyway"
+
+    step "Applying WARP+ license to existing device..."
+    warp_set_license "$WARP_ACCOUNT_FILE" "$key"
+    chmod 600 "$WARP_ACCOUNT_FILE"
+
+    if ! warp_wgcf_update "$WARP_ACCOUNT_FILE"; then
+        error "Failed to apply WARP+ license (Cloudflare API error or key rejected)"
+        warn "The key may be exhausted (device limit reached) or no longer valid for wgcf devices."
+        return 1
+    fi
+    ok "License pushed to Cloudflare device"
+
+    # Same keys/endpoint → just bounce the tunnel so a fresh handshake picks up
+    # the lifted quota. The native Xray wireguard outbound needs no restart.
+    if systemctl is-active "$WARP_SERVICE" >/dev/null 2>&1 || systemctl is-enabled "$WARP_SERVICE" >/dev/null 2>&1; then
+        if systemctl restart "$WARP_SERVICE" >/dev/null 2>&1; then
+            ok "warp interface restarted"
+        else
+            warn "Could not restart $WARP_SERVICE — check: journalctl -u $WARP_SERVICE"
+        fi
+    fi
+
+    local acct
+    acct=$(warp_account_status "$WARP_ACCOUNT_FILE")
+    info "Account type reported by Cloudflare: $acct"
+    if [ "$acct" = "Free" ]; then
+        warn "Cloudflare still reports a Free account — the key may not have applied."
+    fi
+
+    sleep 2
+    if verify_warp_connection; then
+        ok "WARP+ upgrade completed"
+    else
+        warn "Upgrade done, but connection check failed (interface may still be settling)"
     fi
 }
 
@@ -1347,6 +1507,10 @@ show_status() {
             if command -v wg >/dev/null 2>&1; then
                 wg show warp 2>/dev/null | grep -E "(endpoint|allowed ips|latest handshake)" | sed 's/^/   /' || true
             fi
+            # Тип аккаунта (WARP+ / Free) — best-effort, ходит в Cloudflare API
+            local warp_acct
+            warp_acct=$(warp_account_status)
+            [ "$warp_acct" != "unknown" ] && echo -e "\033[38;5;250m   Account: $warp_acct\033[0m"
             ;;
         "installed")
             warn "Installed but not running"
@@ -1790,10 +1954,13 @@ show_warp_menu() {
     echo -e "   \033[38;5;15m7)\033[0m 📋 View logs"
     echo -e "   \033[38;5;15m8)\033[0m 🧪 Test WARP connection"
     echo
+    echo -e "\033[1;37m⚙️  Configuration:\033[0m"
+    echo -e "   \033[38;5;15m9)\033[0m 🚀 Upgrade to WARP+ (license key)"
+    echo
     echo -e "\033[38;5;8m$(printf '─%.0s' $(seq 1 45))\033[0m"
     echo -e "\033[38;5;15m   0)\033[0m ← Back to main menu"
     echo
-    
+
     case $warp_status in
         "not_installed")
             echo -e "\033[1;34m💡 Tip: Install WARP (1) to get started with Cloudflare's VPN\033[0m"
@@ -1805,9 +1972,9 @@ show_warp_menu() {
             echo -e "\033[1;34m💡 Tip: Test connection (8) to verify WARP is working correctly\033[0m"
             ;;
     esac
-    
+
     echo
-    read -p "$(echo -e "\033[1;37mSelect option [0-8]:\033[0m ")" choice
+    read -p "$(echo -e "\033[1;37mSelect option [0-9]:\033[0m ")" choice
 }
 
 # Подменю Tor
@@ -2556,6 +2723,9 @@ main() {
             regen-warp-xray|warp-reserved)
                 regen_warp_xray_outbound
                 ;;
+            warp-plus|warp-license)
+                apply_warp_plus "$1"
+                ;;
             xray-examples)
                 show_xray_examples
                 ;;
@@ -2609,6 +2779,15 @@ main() {
                         6) show_status; read -p "Press Enter to continue..." ;;
                         7) show_logs warp ;;
                         8) test_connections ;;
+                        9)
+                            read -p "$(echo -e "\033[1;37mEnter WARP+ license key:\033[0m ")" warp_plus_key
+                            if [ -n "$warp_plus_key" ]; then
+                                apply_warp_plus "$warp_plus_key"
+                            else
+                                warn "No key entered — cancelled"
+                            fi
+                            read -p "Press Enter to continue..."
+                            ;;
                         0) break ;;
                         *) echo -e "\033[1;31mInvalid option. Press Enter to try again...\033[0m"; read ;;
                     esac
