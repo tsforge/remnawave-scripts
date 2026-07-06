@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Version: 4.3.3
 set -e
-SCRIPT_VERSION="4.3.5"
+SCRIPT_VERSION="4.3.6"
 
 # Handle @ prefix for consistency with other scripts
 if [ $# -gt 0 ] && [ "$1" = "@" ]; then
@@ -1049,22 +1049,18 @@ install_remnanode() {
     fi
     echo
 
-    # Ask about installing Xray-core
+    # Install Xray-core only when explicitly requested via --xray.
+    # We no longer prompt for it during installation: the "latest" stable Xray-core
+    # is currently incompatible with the newest node (only the pre-release build works),
+    # so installing the stable release here would be useless.
     INSTALL_XRAY=false
     if [ "$FORCE_INSTALL_XRAY" == "true" ]; then
         colorized_echo green "✅ Installing Xray-core (--xray flag)"
         INSTALL_XRAY=true
         install_latest_xray_core
-    elif [ "$FORCE_INSTALL_XRAY" == "false" ] || [ "$FORCE_MODE" == "true" ]; then
-        # Force mode defaults to NOT installing Xray-core
-        colorized_echo gray "ℹ️  Skipping Xray-core installation (use --xray to install)"
-        INSTALL_XRAY=false
     else
-        read -p "Do you want to install the latest version of Xray-core? (y/n): " -r install_xray
-        if [[ "$install_xray" =~ ^[Yy]$ ]]; then
-            INSTALL_XRAY=true
-            install_latest_xray_core
-        fi
+        colorized_echo gray "ℹ️  Skipping Xray-core installation (use --xray flag, or run 'core-update' later to install)"
+        INSTALL_XRAY=false
     fi
 
     colorized_echo blue "Generating .env file"
