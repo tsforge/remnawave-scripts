@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WARP & Tor Network Setup Script
 # This script installs and manages Cloudflare WARP and Tor connections
-# VERSION=1.5.0
+# VERSION=1.5.1
 
 # NB: this is an interactive, status-returning menu script. We deliberately do
 # NOT use `set -e` (errexit): many functions return non-zero as a normal status
@@ -9,7 +9,7 @@
 # break the menu loop. We keep `set -E` (errtrace) so the ERR trap below can
 # surface genuinely unexpected failures for diagnostics without exiting.
 set -E
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Error handler for debugging (diagnostic only — never exits)
@@ -1074,11 +1074,14 @@ warp_set_license() {
 
 # Push the account (incl. a changed license_key) to Cloudflare. Same transient
 # 5xx retry policy as registration.
+# NOTE: point wgcf at the account file with `--config` — the WGCF_ACCOUNT env var
+# is NOT honoured by wgcf (v2.2.x); it silently falls back to ./wgcf-account.toml
+# and fails with "no account detected". Same applies in warp_account_status.
 warp_wgcf_update() {
     local account="$1" attempt
     command -v wgcf >/dev/null 2>&1 || return 127
     for attempt in 1 2 3; do
-        if WGCF_ACCOUNT="$account" timeout 30 wgcf update >/dev/null 2>&1; then
+        if timeout 30 wgcf update --config "$account" >/dev/null 2>&1; then
             return 0
         fi
         warn "WARP+ update attempt $attempt failed, retrying in 3s..."
@@ -1094,7 +1097,7 @@ warp_account_status() {
     [ -f "$account" ] || { echo "unknown"; return; }
     command -v wgcf >/dev/null 2>&1 || { echo "unknown"; return; }
     local out
-    out=$(WGCF_ACCOUNT="$account" timeout 8 wgcf status 2>/dev/null) || { echo "unknown"; return; }
+    out=$(timeout 8 wgcf status --config "$account" 2>/dev/null) || { echo "unknown"; return; }
     [ -n "$out" ] || { echo "unknown"; return; }
     if printf '%s' "$out" | grep -qiE 'unlimited|warp\+'; then
         echo "WARP+"
